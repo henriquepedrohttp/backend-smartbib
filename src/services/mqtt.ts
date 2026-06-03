@@ -59,7 +59,7 @@ export function connectMQTT(): Promise<void> {
   });
 }
 
-export function publishCommand(salaId: number, command: "reservar" | "ocupar" | "liberar"): void {
+export function publishCommand(salaId: number, command: "ocupar" | "liberar"): void {
   const topic = `senac/biblioteca/sala${salaId}/comando`;
   if (client && client.connected) {
     client.publish(topic, command, { qos: 1 }, (err) => {

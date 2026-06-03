@@ -50,7 +50,7 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const result = db.exec("SELECT last_insert_rowid() as id");
   const reservaId = result[0].values[0][0] as number;
 
-  publishCommand(salaId, "reservar");
+  publishCommand(salaId, "ocupar");
 
   scheduleAutoCancel(reservaId, salaId, 10);
 
