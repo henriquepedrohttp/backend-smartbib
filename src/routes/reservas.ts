@@ -23,8 +23,8 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   }
 
   const [salaIdDb, nome, status] = sala[0].values[0] as [number, string, string];
-  if (status !== "livre") {
-    res.status(409).json({ error: `Sala ${nome} não está disponível (status: ${status})` });
+  if (status === "ocupada") {
+    res.status(409).json({ error: `Sala ${nome} está ocupada no momento` });
     return;
   }
 
