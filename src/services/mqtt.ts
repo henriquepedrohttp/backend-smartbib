@@ -2,26 +2,32 @@ import mqtt, { MqttClient } from "mqtt";
 import { getDb, saveDb } from "../database";
 
 const BROKER_URL = "mqtt://broker.hivemq.com:1883";
-const CLIENT_ID = "smartbib_backend_" + Math.random().toString(16).slice(2, 10);
 
-let client: MqttClient;
+let client: MqttClient | null = null;
 const roomStatusCache = new Map<number, string>();
+let connectionAttempt = 0;
+const MAX_RETRIES = 10;
+const BASE_RETRY_MS = 2000;
 
 export function getRoomStatus(salaId: number): string {
   return roomStatusCache.get(salaId) || "livre";
 }
 
 export function connectMQTT(): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    const clientId = "smartbib_backend_" + Math.random().toString(16).slice(2, 10);
+
     client = mqtt.connect(BROKER_URL, {
-      clientId: CLIENT_ID,
+      clientId,
       clean: true,
       connectTimeout: 10000,
+      reconnectPeriod: 5000,
     });
 
     client.on("connect", () => {
-      console.log("[MQTT] Conectado ao broker HiveMQ como", CLIENT_ID);
-      client.subscribe("senac/biblioteca/+/status", (err) => {
+      connectionAttempt = 0;
+      console.log("[MQTT] Conectado ao broker HiveMQ como", clientId);
+      client?.subscribe("senac/biblioteca/+/status", (err) => {
         if (err) {
           console.error("[MQTT] Erro ao subscrever:", err);
         } else {
@@ -33,7 +39,13 @@ export function connectMQTT(): Promise<void> {
 
     client.on("error", (err) => {
       console.error("[MQTT] Erro:", err.message);
-      reject(err);
+      if (connectionAttempt < MAX_RETRIES) {
+        connectionAttempt++;
+        console.log(`[MQTT] Tentativa de reconexão ${connectionAttempt}/${MAX_RETRIES}`);
+      } else {
+        console.error("[MQTT] Máximo de tentativas atingido. Comandos MQTT serão ignorados até reconexão.");
+      }
+      resolve();
     });
 
     client.on("message", (topic, message) => {
@@ -52,26 +64,40 @@ export function connectMQTT(): Promise<void> {
       }
     });
 
-    client.on("close", () => {
-      console.log("[MQTT] Conexão fechada, reconectando em 5s...");
-      setTimeout(() => connectMQTT().catch(console.error), 5000);
+    client.on("reconnect", () => {
+      connectionAttempt = 0;
+      console.log("[MQTT] Reconectando...");
     });
+
+    client.on("offline", () => {
+      console.warn("[MQTT] Cliente offline");
+    });
+
+    client.on("close", () => {
+      console.log("[MQTT] Conexão fechada");
+    });
+
+    resolve();
   });
 }
 
-export function publishCommand(salaId: number, command: "ocupar" | "liberar"): void {
+export function publishCommand(salaId: number, command: "reservar" | "ocupar" | "liberar"): void {
   const topic = `senac/biblioteca/sala${salaId}/comando`;
-  if (client && client.connected) {
-    client.publish(topic, command, { qos: 1 }, (err) => {
-      if (err) {
-        console.error(`[MQTT] Erro ao publicar em ${topic}:`, err.message);
-      } else {
-        console.log(`[MQTT] Publicado: ${topic} -> "${command}"`);
-      }
-    });
-  } else {
-    console.warn("[MQTT] Cliente não conectado, não foi possível publicar");
+  if (!client) {
+    console.warn("[MQTT] Cliente não inicializado");
+    return;
   }
+  if (!client.connected) {
+    console.warn(`[MQTT] Cliente desconectado. Comando "${command}" para sala ${salaId} não enviado. Será processado no próximo ciclo do scheduler.`);
+    return;
+  }
+  client.publish(topic, command, { qos: 1 }, (err) => {
+    if (err) {
+      console.error(`[MQTT] Erro ao publicar em ${topic}:`, err.message);
+    } else {
+      console.log(`[MQTT] Publicado: ${topic} -> "${command}"`);
+    }
+  });
 }
 
 export function isMqttConnected(): boolean {
