@@ -5,6 +5,9 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo "[SmartBib] Iniciando configuracao da instancia..."
 
+echo "[SmartBib] Configurando timezone para America/Sao_Paulo..."
+timedatectl set-timezone America/Sao_Paulo
+
 echo "[SmartBib] Atualizando pacotes..."
 apt-get update -y
 apt-get upgrade -y
