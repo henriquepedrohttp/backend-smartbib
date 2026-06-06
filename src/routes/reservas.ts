@@ -5,6 +5,7 @@ import { publishCommand } from "../services/mqtt";
 
 const router = Router();
 
+// POST criar reserva
 router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const { salaId, data, horaInicio, horaFim } = req.body;
 
@@ -30,8 +31,8 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const conflito = db.exec(
     `SELECT id FROM reservas
      WHERE sala_id = ? AND data = ? AND status != 'cancelada'
-       AND hora_inicio < ? AND hora_fim > ?`,
-    [salaId, data, horaFim, horaInicio]
+       AND NOT (hora_fim <= ? OR hora_inicio >= ?)`,
+    [salaId, data, horaInicio, horaFim]
   );
   if (conflito.length > 0 && conflito[0].values.length > 0) {
     res.status(409).json({ error: "Já existe uma reserva neste horário para esta sala" });
@@ -59,6 +60,7 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   });
 });
 
+// GET listar reservas do usuário
 router.get("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const db = getDb();
   const rows = db.exec(
@@ -89,6 +91,65 @@ router.get("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   res.json(reservas);
 });
 
+// 🆕 LIMPAR TODO O HISTÓRICO (remove todas as reservas finalizadas)
+// ATENÇÃO: Deve vir ANTES de qualquer rota que use :id
+router.delete("/historico/limpar", authMiddleware, (req: AuthRequest, res: Response): void => {
+  console.log("[API] Rota /historico/limpar chamada");
+  const db = getDb();
+  const userId = req.userId!;
+
+  const agora = new Date();
+  const agoraStr = agora.toISOString().slice(0, 19).replace("T", " ");
+
+  const deleteStmt = db.prepare(`
+    DELETE FROM reservas
+    WHERE user_id = ?
+      AND ( status = 'cancelada'
+            OR (data || ' ' || hora_fim) <= ? )
+  `);
+  deleteStmt.run([userId, agoraStr]);
+  deleteStmt.free();
+
+  saveDb();
+  res.json({ message: "Histórico limpo com sucesso" });
+});
+
+// 🆕 EXCLUIR UMA RESERVA PERMANENTEMENTE (do histórico)
+router.delete("/:id/permanent", authMiddleware, (req: AuthRequest, res: Response): void => {
+  const reservaId = parseInt(req.params.id, 10);
+  if (isNaN(reservaId)) {
+    res.status(400).json({ error: "ID inválido" });
+    return;
+  }
+
+  const db = getDb();
+
+  const row = db.exec(
+    "SELECT id, status, data, hora_fim FROM reservas WHERE id = ? AND user_id = ?",
+    [reservaId, req.userId]
+  );
+
+  if (row.length === 0 || row[0].values.length === 0) {
+    res.status(404).json({ error: "Reserva não encontrada" });
+    return;
+  }
+
+  const [id, status, data, horaFim] = row[0].values[0] as [number, string, string, string];
+
+  const agora = new Date();
+  const fim = new Date(`${data}T${horaFim}:00`);
+  if (status !== "cancelada" && fim > agora) {
+    res.status(400).json({ error: "Não é possível excluir uma reserva ativa. Use 'Liberar' primeiro." });
+    return;
+  }
+
+  db.run("DELETE FROM reservas WHERE id = ?", [reservaId]);
+  saveDb();
+
+  res.json({ message: "Reserva removida permanentemente do histórico." });
+});
+
+// DELETE cancelar reserva (apenas muda status para 'cancelada')
 router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
@@ -134,6 +195,7 @@ router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void =>
   res.json({ message: `Reserva da ${nome} cancelada com sucesso` });
 });
 
+// POST confirmar reserva (ocupar)
 router.post("/:id/ocupar", authMiddleware, (req: AuthRequest, res: Response): void => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {

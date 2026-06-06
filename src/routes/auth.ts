@@ -29,7 +29,7 @@ router.post("/register", (req: Request, res: Response): void => {
   const result = db.exec("SELECT last_insert_rowid() as id");
   const userId = result[0].values[0][0] as number;
 
-  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+  const token = jwt.sign({ userId }, JWT_SECRET, { expiresIn: "1h" });
 
   res.status(201).json({ token, userId, email });
 });
