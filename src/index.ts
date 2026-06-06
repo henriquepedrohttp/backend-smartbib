@@ -1,7 +1,9 @@
+import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { initDb } from "./database";
 import { connectMQTT } from "./services/mqtt";
+import { startMqttScheduler } from "./services/mqttScheduler";
 import authRoutes from "./routes/auth";
 import salasRoutes from "./routes/salas";
 import reservasRoutes from "./routes/reservas";
@@ -28,7 +30,10 @@ async function start() {
 
     console.log("[Backend] Conectando ao MQTT...");
     await connectMQTT();
-    console.log("[Backend] MQTT conectado");
+    console.log("[Backend] MQTT inicializado (conexao pode estar pendente)");
+
+    console.log("[Backend] Iniciando agendador MQTT...");
+    startMqttScheduler();
 
     app.listen(PORT, () => {
       console.log(`[Backend] Servidor rodando em http://localhost:${PORT}`);

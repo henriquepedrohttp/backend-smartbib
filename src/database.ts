@@ -57,11 +57,30 @@ export async function initDb(): Promise<Database> {
       hora_inicio TEXT NOT NULL,
       hora_fim TEXT NOT NULL,
       status TEXT DEFAULT 'pendente' CHECK(status IN ('pendente', 'confirmada', 'cancelada')),
+      mqtt_inicio_enviado INTEGER DEFAULT 0,
+      mqtt_fim_enviado INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now', 'localtime')),
       FOREIGN KEY (user_id) REFERENCES users(id),
       FOREIGN KEY (sala_id) REFERENCES salas(id)
     )
   `);
+
+  try {
+    db.exec("SELECT mqtt_inicio_enviado FROM reservas LIMIT 0");
+  } catch {
+    console.log("[DB] Migrando tabela reservas: adicionando colunas mqtt_inicio_enviado e mqtt_fim_enviado");
+    db.run("ALTER TABLE reservas ADD COLUMN mqtt_inicio_enviado INTEGER DEFAULT 0");
+    db.run("ALTER TABLE reservas ADD COLUMN mqtt_fim_enviado INTEGER DEFAULT 0");
+    saveDb();
+  }
+
+  try {
+    db.exec("SELECT mqtt_inicio_enviado_at FROM reservas LIMIT 0");
+  } catch {
+    console.log("[DB] Migrando tabela reservas: adicionando coluna mqtt_inicio_enviado_at");
+    db.run("ALTER TABLE reservas ADD COLUMN mqtt_inicio_enviado_at TEXT DEFAULT NULL");
+    saveDb();
+  }
 
   seedSalas();
 

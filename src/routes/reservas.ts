@@ -2,10 +2,10 @@ import { Router, Response } from "express";
 import { getDb, saveDb } from "../database";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 import { publishCommand } from "../services/mqtt";
-import { scheduleAutoCancel } from "../services/scheduler";
 
 const router = Router();
 
+// POST criar reserva
 router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const { salaId, data, horaInicio, horaFim } = req.body;
 
@@ -23,16 +23,16 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   }
 
   const [salaIdDb, nome, status] = sala[0].values[0] as [number, string, string];
-  if (status !== "livre") {
-    res.status(409).json({ error: `Sala ${nome} não está disponível (status: ${status})` });
+  if (status === "ocupada") {
+    res.status(409).json({ error: `Sala ${nome} está ocupada no momento` });
     return;
   }
 
   const conflito = db.exec(
     `SELECT id FROM reservas
      WHERE sala_id = ? AND data = ? AND status != 'cancelada'
-       AND hora_inicio < ? AND hora_fim > ?`,
-    [salaId, data, horaFim, horaInicio]
+       AND NOT (hora_fim <= ? OR hora_inicio >= ?)`,
+    [salaId, data, horaInicio, horaFim]
   );
   if (conflito.length > 0 && conflito[0].values.length > 0) {
     res.status(409).json({ error: "Já existe uma reserva neste horário para esta sala" });
@@ -40,19 +40,14 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   }
 
   db.run(
-    "INSERT INTO reservas (user_id, sala_id, data, hora_inicio, hora_fim, status) VALUES (?, ?, ?, ?, ?, 'pendente')",
+    "INSERT INTO reservas (user_id, sala_id, data, hora_inicio, hora_fim, status, mqtt_inicio_enviado, mqtt_fim_enviado) VALUES (?, ?, ?, ?, ?, 'pendente', 0, 0)",
     [req.userId, salaId, data, horaInicio, horaFim]
   );
 
-  db.run("UPDATE salas SET status = 'reservada' WHERE id = ?", [salaId]);
   saveDb();
 
   const result = db.exec("SELECT last_insert_rowid() as id");
   const reservaId = result[0].values[0][0] as number;
-
-  publishCommand(salaId, "reservar");
-
-  scheduleAutoCancel(reservaId, salaId, 10);
 
   res.status(201).json({
     id: reservaId,
@@ -65,6 +60,7 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   });
 });
 
+// GET listar reservas do usuário
 router.get("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   const db = getDb();
   const rows = db.exec(
@@ -95,6 +91,65 @@ router.get("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   res.json(reservas);
 });
 
+// 🆕 LIMPAR TODO O HISTÓRICO (remove todas as reservas finalizadas)
+// ATENÇÃO: Deve vir ANTES de qualquer rota que use :id
+router.delete("/historico/limpar", authMiddleware, (req: AuthRequest, res: Response): void => {
+  console.log("[API] Rota /historico/limpar chamada");
+  const db = getDb();
+  const userId = req.userId!;
+
+  const agora = new Date();
+  const agoraStr = agora.toISOString().slice(0, 19).replace("T", " ");
+
+  const deleteStmt = db.prepare(`
+    DELETE FROM reservas
+    WHERE user_id = ?
+      AND ( status = 'cancelada'
+            OR (data || ' ' || hora_fim) <= ? )
+  `);
+  deleteStmt.run([userId, agoraStr]);
+  deleteStmt.free();
+
+  saveDb();
+  res.json({ message: "Histórico limpo com sucesso" });
+});
+
+// 🆕 EXCLUIR UMA RESERVA PERMANENTEMENTE (do histórico)
+router.delete("/:id/permanent", authMiddleware, (req: AuthRequest, res: Response): void => {
+  const reservaId = parseInt(req.params.id, 10);
+  if (isNaN(reservaId)) {
+    res.status(400).json({ error: "ID inválido" });
+    return;
+  }
+
+  const db = getDb();
+
+  const row = db.exec(
+    "SELECT id, status, data, hora_fim FROM reservas WHERE id = ? AND user_id = ?",
+    [reservaId, req.userId]
+  );
+
+  if (row.length === 0 || row[0].values.length === 0) {
+    res.status(404).json({ error: "Reserva não encontrada" });
+    return;
+  }
+
+  const [id, status, data, horaFim] = row[0].values[0] as [number, string, string, string];
+
+  const agora = new Date();
+  const fim = new Date(`${data}T${horaFim}:00`);
+  if (status !== "cancelada" && fim > agora) {
+    res.status(400).json({ error: "Não é possível excluir uma reserva ativa. Use 'Liberar' primeiro." });
+    return;
+  }
+
+  db.run("DELETE FROM reservas WHERE id = ?", [reservaId]);
+  saveDb();
+
+  res.json({ message: "Reserva removida permanentemente do histórico." });
+});
+
+// DELETE cancelar reserva (apenas muda status para 'cancelada')
 router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
@@ -104,7 +159,7 @@ router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void =>
 
   const db = getDb();
   const rows = db.exec(
-    "SELECT r.id, r.sala_id, r.status, s.nome FROM reservas r JOIN salas s ON r.sala_id = s.id WHERE r.id = ? AND r.user_id = ?",
+    "SELECT r.id, r.sala_id, r.status, r.mqtt_inicio_enviado, s.nome FROM reservas r JOIN salas s ON r.sala_id = s.id WHERE r.id = ? AND r.user_id = ?",
     [reservaId, req.userId]
   );
 
@@ -113,14 +168,14 @@ router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void =>
     return;
   }
 
-  const [id, salaId, status, nome] = rows[0].values[0] as [number, number, string, string];
+  const [id, salaId, status, mqttInicioEnviado, nome] = rows[0].values[0] as [number, number, string, number, string];
 
   if (status === "cancelada") {
     res.status(400).json({ error: "Reserva já está cancelada" });
     return;
   }
 
-  db.run("UPDATE reservas SET status = 'cancelada' WHERE id = ?", [reservaId]);
+  db.run("UPDATE reservas SET status = 'cancelada', mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
 
   const outrasAtivas = db.exec(
     "SELECT COUNT(*) as c FROM reservas WHERE sala_id = ? AND status != 'cancelada' AND id != ?",
@@ -133,11 +188,14 @@ router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void =>
 
   saveDb();
 
-  publishCommand(salaId, "liberar");
+  if (mqttInicioEnviado === 1) {
+    publishCommand(salaId, "liberar");
+  }
 
   res.json({ message: `Reserva da ${nome} cancelada com sucesso` });
 });
 
+// POST confirmar reserva (ocupar)
 router.post("/:id/ocupar", authMiddleware, (req: AuthRequest, res: Response): void => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
@@ -147,7 +205,7 @@ router.post("/:id/ocupar", authMiddleware, (req: AuthRequest, res: Response): vo
 
   const db = getDb();
   const rows = db.exec(
-    "SELECT r.id, r.sala_id, r.status FROM reservas r WHERE r.id = ? AND r.user_id = ?",
+    "SELECT r.id, r.sala_id, r.status, r.data, r.hora_inicio, r.hora_fim FROM reservas r WHERE r.id = ? AND r.user_id = ?",
     [reservaId, req.userId]
   );
 
@@ -156,14 +214,29 @@ router.post("/:id/ocupar", authMiddleware, (req: AuthRequest, res: Response): vo
     return;
   }
 
-  const [id, salaId, status] = rows[0].values[0] as [number, number, string];
+  const [id, salaId, status, data, horaInicio, horaFim] = rows[0].values[0] as [number, number, string, string, string, string];
 
   if (status === "cancelada") {
     res.status(400).json({ error: "Reserva já foi cancelada" });
     return;
   }
 
-  db.run("UPDATE reservas SET status = 'confirmada' WHERE id = ?", [reservaId]);
+  if (status === "confirmada") {
+    res.status(400).json({ error: "Reserva já foi confirmada" });
+    return;
+  }
+
+  const nowLocal = db.exec("SELECT datetime('now', 'localtime') as now")[0].values[0][0] as string;
+  const inicio = `${data} ${horaInicio}`;
+  const fim = `${data} ${horaFim}`;
+
+  if (nowLocal < inicio || nowLocal > fim) {
+    res.status(400).json({ error: "Só é possível confirmar a reserva durante o horário reservado" });
+    return;
+  }
+
+  const now = new Date().toISOString().replace("T", " ").replace("Z", "");
+  db.run("UPDATE reservas SET status = 'confirmada', mqtt_inicio_enviado = 1, mqtt_inicio_enviado_at = ? WHERE id = ?", [now, reservaId]);
   db.run("UPDATE salas SET status = 'ocupada' WHERE id = ?", [salaId]);
   saveDb();
 

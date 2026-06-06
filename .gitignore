@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.db
 .env
+
+# Terraform
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.backup
+infra/*.tfvars
+infra/smartbib-key.pem
