@@ -16,6 +16,9 @@ const ALL_SLOTS = [
   { inicio: "16:00", fim: "17:00" },
   { inicio: "17:00", fim: "18:00" },
   { inicio: "18:00", fim: "19:00" },
+  { inicio: "19:00", fim: "20:00" },
+  { inicio: "20:00", fim: "21:00" },
+  { inicio: "21:00", fim: "22:00" },
 ];
 
 router.get("/", authMiddleware, (_req: AuthRequest, res: Response): void => {
