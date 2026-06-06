@@ -1,11 +1,10 @@
 import { getDb, saveDb } from "../database";
 import { publishCommand, isMqttConnected } from "./mqtt";
 
-const POLL_INTERVAL_MS = 60 * 1000; // verifica a cada 1 minuto
+const POLL_INTERVAL_MS = 60 * 1000;
 
 let intervalId: NodeJS.Timeout | null = null;
 
-// Envia comando "reservar" quando o horário de início chega
 function processOcupar(): void {
   const db = getDb();
   const connected = isMqttConnected();
@@ -37,14 +36,14 @@ function processOcupar(): void {
   saveDb();
 }
 
-// Cancela reservas pendentes que não foram confirmadas até 10 minutos após o início
 function processAutoCancel(): void {
   const db = getDb();
 
   const rows = db.exec(
     `SELECT id, sala_id FROM reservas
      WHERE status = 'pendente'
-       AND datetime(data || ' ' || hora_inicio, '+2 minutes') <= datetime('now', 'localtime')`
+       AND datetime(data || ' ' || hora_inicio, '+5 minutes') <= datetime('now', 'localtime')
+       AND created_at <= (data || ' ' || hora_inicio)`
   );
 
   if (rows.length === 0 || rows[0].values.length === 0) return;
@@ -52,10 +51,8 @@ function processAutoCancel(): void {
   for (const row of rows[0].values) {
     const [reservaId, salaId] = row as [number, number];
 
-    // Cancela a reserva
     db.run("UPDATE reservas SET status = 'cancelada', mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
 
-    // Verifica se há outras reservas ativas para a mesma sala
     const outrasAtivas = db.exec(
       "SELECT COUNT(*) as c FROM reservas WHERE sala_id = ? AND status != 'cancelada' AND id != ?",
       [salaId, reservaId]
@@ -65,16 +62,14 @@ function processAutoCancel(): void {
       db.run("UPDATE salas SET status = 'livre' WHERE id = ?", [salaId]);
     }
 
-    // Libera a sala via MQTT (caso o comando "reservar" já tenha sido enviado)
     publishCommand(salaId, "liberar");
 
-    console.log(`[MQTTScheduler] Reserva ${reservaId}: auto-cancelada (não confirmada em 10 minutos após o início)`);
+    console.log(`[MQTTScheduler] Reserva ${reservaId}: auto-cancelada (não confirmada em 5 minutos após o início)`);
   }
 
   saveDb();
 }
 
-// Envia comando "liberar" quando o horário de fim chega
 function processLiberar(): void {
   const db = getDb();
 
@@ -91,7 +86,6 @@ function processLiberar(): void {
 
     db.run("UPDATE reservas SET mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
 
-    // Se ainda está pendente (nunca confirmada), cancela também
     if (status === "pendente") {
       db.run("UPDATE reservas SET status = 'cancelada' WHERE id = ?", [reservaId]);
     }
