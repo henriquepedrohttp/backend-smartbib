@@ -20,10 +20,29 @@ variable "jwt_secret" {
   description = "Secret JWT para o backend. Se vazio, sera gerado automaticamente."
   type        = string
   default     = ""
+  sensitive   = true
 }
 
 variable "key_name" {
   description = "Nome do key pair SSH"
   type        = string
   default     = "smartbib-key"
+}
+
+variable "db_name" {
+  description = "Nome do banco de dados PostgreSQL"
+  type        = string
+  default     = "smartbib"
+}
+
+variable "db_username" {
+  description = "Usuario do banco de dados PostgreSQL"
+  type        = string
+  default     = "smartbib"
+}
+
+variable "db_password" {
+  description = "Senha do banco de dados PostgreSQL"
+  type        = string
+  sensitive   = true
 }

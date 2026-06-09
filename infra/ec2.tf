@@ -22,6 +22,11 @@ resource "aws_instance" "smartbib" {
   user_data              = templatefile("${path.module}/user_data.sh", {
     github_repo = var.github_repo
     jwt_secret  = local.jwt_secret
+    db_host     = aws_db_instance.smartbib.address
+    db_port     = aws_db_instance.smartbib.port
+    db_name     = var.db_name
+    db_username = var.db_username
+    db_password = var.db_password
     nginx_conf  = file("${path.module}/nginx.conf")
   })
 

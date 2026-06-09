@@ -19,6 +19,17 @@ resource "aws_subnet" "public" {
   }
 }
 
+resource "aws_subnet" "public_az2" {
+  vpc_id                  = aws_vpc.smartbib.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "${var.aws_region}b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "smartbib-public-subnet-az2"
+  }
+}
+
 resource "aws_internet_gateway" "smartbib" {
   vpc_id = aws_vpc.smartbib.id
 
@@ -32,7 +43,7 @@ resource "aws_route_table" "public" {
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id  = aws_internet_gateway.smartbib.id
+    gateway_id = aws_internet_gateway.smartbib.id
   }
 
   tags = {
@@ -42,5 +53,10 @@ resource "aws_route_table" "public" {
 
 resource "aws_route_table_association" "public" {
   subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "public_az2" {
+  subnet_id      = aws_subnet.public_az2.id
   route_table_id = aws_route_table.public.id
 }

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import { initDb } from "./database";
+import prisma from "./lib/prisma";
 import { connectMQTT } from "./services/mqtt";
 import { startMqttScheduler } from "./services/mqttScheduler";
 import authRoutes from "./routes/auth";
@@ -24,13 +24,55 @@ app.get("/api/health", (_req, res) => {
 
 async function start() {
   try {
-    console.log("[Backend] Inicializando banco de dados...");
-    await initDb();
-    console.log("[Backend] Banco de dados inicializado");
+    console.log("[Backend] Conectando ao banco de dados...");
+    await prisma.$connect();
+    console.log("[Backend] Banco de dados conectado");
+
+    const salaCount = await prisma.sala.count();
+    if (salaCount === 0) {
+      console.log("[Backend] Tabela salas vazia, executando seed...");
+      await prisma.sala.createMany({
+        data: [
+          {
+            nome: "Sala 1",
+            capacidade: 4,
+            andar: 1,
+            recursos: JSON.stringify(["quadro", "wifi", "ar-condicionado"]),
+            icon: "users",
+            status: "livre",
+          },
+          {
+            nome: "Sala 2",
+            capacidade: 6,
+            andar: 1,
+            recursos: JSON.stringify(["projetor", "wifi", "ar-condicionado"]),
+            icon: "presentation",
+            status: "livre",
+          },
+          {
+            nome: "Sala 3",
+            capacidade: 3,
+            andar: 2,
+            recursos: JSON.stringify(["tv", "wifi", "ar-condicionado"]),
+            icon: "video",
+            status: "livre",
+          },
+          {
+            nome: "Sala 4",
+            capacidade: 2,
+            andar: 2,
+            recursos: JSON.stringify(["quadro", "wifi"]),
+            icon: "briefcase",
+            status: "livre",
+          },
+        ],
+      });
+      console.log("[Backend] Seed concluído");
+    }
 
     console.log("[Backend] Conectando ao MQTT...");
     await connectMQTT();
-    console.log("[Backend] MQTT inicializado (conexao pode estar pendente)");
+    console.log("[Backend] MQTT inicializado (conexão pode estar pendente)");
 
     console.log("[Backend] Iniciando agendador MQTT...");
     startMqttScheduler();

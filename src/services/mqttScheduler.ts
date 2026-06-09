@@ -1,117 +1,137 @@
-import { getDb, saveDb } from "../database";
+import prisma from "../lib/prisma";
 import { publishCommand, isMqttConnected } from "./mqtt";
 
 const POLL_INTERVAL_MS = 60 * 1000;
 
 let intervalId: NodeJS.Timeout | null = null;
 
-function processOcupar(): void {
-  const db = getDb();
+async function processOcupar(): Promise<void> {
   const connected = isMqttConnected();
+  const now = new Date();
 
-  const rows = db.exec(
-    `SELECT id, sala_id FROM reservas
-     WHERE status != 'cancelada' AND mqtt_inicio_enviado = 0
-       AND (data || ' ' || hora_inicio) <= datetime('now', 'localtime')`
-  );
+  const reservas = await prisma.reserva.findMany({
+    where: {
+      status: { not: "cancelada" },
+      mqttInicioEnviado: 0,
+    },
+    select: { id: true, salaId: true, data: true, horaInicio: true },
+  });
 
-  if (rows.length === 0 || rows[0].values.length === 0) return;
+  const pendentes = reservas.filter((r) => {
+    const [h, m] = r.horaInicio.split(":").map(Number);
+    const inicio = new Date(`${r.data}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`);
+    return inicio <= now;
+  });
 
-  const now = new Date().toISOString().replace("T", " ").replace("Z", "");
+  if (pendentes.length === 0) return;
 
-  for (const row of rows[0].values) {
-    const [reservaId, salaId] = row as [number, number];
-
-    publishCommand(salaId, "reservar");
+  for (const r of pendentes) {
+    publishCommand(r.salaId, "reservar");
 
     if (connected) {
-      db.run("UPDATE reservas SET mqtt_inicio_enviado = 1, mqtt_inicio_enviado_at = ? WHERE id = ?", [now, reservaId]);
-      db.run("UPDATE salas SET status = 'reservada' WHERE id = ?", [salaId]);
-      console.log(`[MQTTScheduler] Reserva ${reservaId}: comando "reservar" enviado para sala ${salaId}`);
+      await prisma.reserva.update({
+        where: { id: r.id },
+        data: { mqttInicioEnviado: 1, mqttInicioEnviadoAt: now },
+      });
+      await prisma.sala.update({
+        where: { id: r.salaId },
+        data: { status: "reservada" },
+      });
+      console.log(`[MQTTScheduler] Reserva ${r.id}: comando "reservar" enviado para sala ${r.salaId}`);
     } else {
-      console.warn(`[MQTTScheduler] Reserva ${reservaId}: MQTT offline, tentará enviar "reservar" no próximo ciclo`);
+      console.warn(`[MQTTScheduler] Reserva ${r.id}: MQTT offline, tentará enviar "reservar" no próximo ciclo`);
     }
   }
-
-  saveDb();
 }
 
-function processAutoCancel(): void {
-  const db = getDb();
+async function processAutoCancel(): Promise<void> {
+  const now = new Date();
 
-  const rows = db.exec(
-    `SELECT id, sala_id FROM reservas
-     WHERE status = 'pendente'
-       AND datetime(data || ' ' || hora_inicio, '+5 minutes') <= datetime('now', 'localtime')
-       AND created_at <= (data || ' ' || hora_inicio)`
-  );
+  const reservas = await prisma.reserva.findMany({
+    where: { status: "pendente" },
+    select: { id: true, salaId: true, data: true, horaInicio: true, createdAt: true },
+  });
 
-  if (rows.length === 0 || rows[0].values.length === 0) return;
+  const cancela = reservas.filter((r) => {
+    const [h, m] = r.horaInicio.split(":").map(Number);
+    const inicio = new Date(`${r.data}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`);
+    const limite = new Date(inicio.getTime() + 5 * 60 * 1000);
+    if (limite > now) return false;
+    if (r.createdAt > inicio) return false;
+    return true;
+  });
 
-  for (const row of rows[0].values) {
-    const [reservaId, salaId] = row as [number, number];
+  if (cancela.length === 0) return;
 
-    db.run("UPDATE reservas SET status = 'cancelada', mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
+  for (const r of cancela) {
+    await prisma.reserva.update({
+      where: { id: r.id },
+      data: { status: "cancelada", mqttFimEnviado: 1 },
+    });
 
-    const outrasAtivas = db.exec(
-      "SELECT COUNT(*) as c FROM reservas WHERE sala_id = ? AND status != 'cancelada' AND id != ?",
-      [salaId, reservaId]
-    );
-    const count = outrasAtivas[0].values[0][0] as number;
-    if (count === 0) {
-      db.run("UPDATE salas SET status = 'livre' WHERE id = ?", [salaId]);
+    const outrasAtivas = await prisma.reserva.count({
+      where: { salaId: r.salaId, status: { not: "cancelada" }, id: { not: r.id } },
+    });
+    if (outrasAtivas === 0) {
+      await prisma.sala.update({ where: { id: r.salaId }, data: { status: "livre" } });
     }
 
-    publishCommand(salaId, "liberar");
+    publishCommand(r.salaId, "liberar");
 
-    console.log(`[MQTTScheduler] Reserva ${reservaId}: auto-cancelada (não confirmada em 5 minutos após o início)`);
+    console.log(`[MQTTScheduler] Reserva ${r.id}: auto-cancelada (não confirmada em 5 minutos após o início)`);
   }
-
-  saveDb();
 }
 
-function processLiberar(): void {
-  const db = getDb();
+async function processLiberar(): Promise<void> {
+  const now = new Date();
 
-  const rows = db.exec(
-    `SELECT id, sala_id, status FROM reservas
-     WHERE status NOT IN ('cancelada') AND mqtt_fim_enviado = 0
-       AND (data || ' ' || hora_fim) <= datetime('now', 'localtime')`
-  );
+  const reservas = await prisma.reserva.findMany({
+    where: {
+      status: { not: "cancelada" },
+      mqttFimEnviado: 0,
+    },
+    select: { id: true, salaId: true, status: true, data: true, horaFim: true },
+  });
 
-  if (rows.length === 0 || rows[0].values.length === 0) return;
+  const finalizadas = reservas.filter((r) => {
+    const [h, m] = r.horaFim.split(":").map(Number);
+    const fim = new Date(`${r.data}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`);
+    return fim <= now;
+  });
 
-  for (const row of rows[0].values) {
-    const [reservaId, salaId, status] = row as [number, number, string];
+  if (finalizadas.length === 0) return;
 
-    db.run("UPDATE reservas SET mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
+  for (const r of finalizadas) {
+    await prisma.reserva.update({
+      where: { id: r.id },
+      data: { mqttFimEnviado: 1 },
+    });
 
-    if (status === "pendente") {
-      db.run("UPDATE reservas SET status = 'cancelada' WHERE id = ?", [reservaId]);
+    if (r.status === "pendente") {
+      await prisma.reserva.update({
+        where: { id: r.id },
+        data: { status: "cancelada" },
+      });
     }
 
-    const outrasAtivas = db.exec(
-      "SELECT COUNT(*) as c FROM reservas WHERE sala_id = ? AND status != 'cancelada' AND id != ?",
-      [salaId, reservaId]
-    );
-    const count = outrasAtivas[0].values[0][0] as number;
-    if (count === 0) {
-      db.run("UPDATE salas SET status = 'livre' WHERE id = ?", [salaId]);
+    const outrasAtivas = await prisma.reserva.count({
+      where: { salaId: r.salaId, status: { not: "cancelada" }, id: { not: r.id } },
+    });
+    if (outrasAtivas === 0) {
+      await prisma.sala.update({ where: { id: r.salaId }, data: { status: "livre" } });
     }
 
-    publishCommand(salaId, "liberar");
+    publishCommand(r.salaId, "liberar");
 
-    console.log(`[MQTTScheduler] Reserva ${reservaId}: horário finalizado, comando "liberar" enviado para sala ${salaId}`);
+    console.log(`[MQTTScheduler] Reserva ${r.id}: horário finalizado, comando "liberar" enviado para sala ${r.salaId}`);
   }
-
-  saveDb();
 }
 
-function tick(): void {
+async function tick(): Promise<void> {
   try {
-    processOcupar();
-    processAutoCancel();
-    processLiberar();
+    await processOcupar();
+    await processAutoCancel();
+    await processLiberar();
   } catch (err) {
     console.error("[MQTTScheduler] Erro no ciclo de polling:", err);
   }

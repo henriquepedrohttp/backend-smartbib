@@ -28,20 +28,33 @@ ln -sf /etc/nginx/sites-available/smartbib /etc/nginx/sites-enabled/smartbib
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
 
+echo "[SmartBib] Aguardando RDS ficar disponivel..."
+sleep 30
+
 echo "[SmartBib] Clonando repositorio..."
 rm -rf /opt/smartbib
 git clone ${github_repo} /opt/smartbib
 
-echo "[SmartBib] Instalando dependencias e buildando..."
+echo "[SmartBib] Instalando dependencias..."
 cd /opt/smartbib
 npm install
+
+echo "[SmartBib] Gerando Prisma client..."
+npx prisma generate
+
+echo "[SmartBib] Buildando TypeScript..."
 npm run build
 
 echo "[SmartBib] Criando arquivo .env..."
 cat > /opt/smartbib/.env << ENV_EOF
 PORT=3000
 JWT_SECRET=${jwt_secret}
+DATABASE_URL=postgresql://${db_username}:${db_password}@${db_host}:${db_port}/${db_name}
 ENV_EOF
+
+echo "[SmartBib] Rodando migrations Prisma..."
+npx prisma migrate deploy
+npm run seed
 
 echo "[SmartBib] Criando systemd service..."
 cat > /etc/systemd/system/smartbib.service << SVC_EOF

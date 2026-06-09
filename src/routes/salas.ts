@@ -1,5 +1,5 @@
 import { Router, Response } from "express";
-import { getDb } from "../database";
+import prisma from "../lib/prisma";
 import { getRoomStatus } from "../services/mqtt";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 
@@ -22,34 +22,30 @@ const ALL_SLOTS = [
   { inicio: "22:00", fim: "23:00" },
 ];
 
-router.get("/", authMiddleware, (_req: AuthRequest, res: Response): void => {
-  const db = getDb();
-  const rows = db.exec(
-    "SELECT id, nome, capacidade, andar, recursos, icon, status FROM salas ORDER BY id"
-  );
+router.get("/", authMiddleware, async (_req: AuthRequest, res: Response): Promise<void> => {
+  const salas = await prisma.sala.findMany({
+    orderBy: { id: "asc" },
+  });
 
-  const salas = rows[0]?.values.map((row: any[]) => {
-    const [id, nome, capacidade, andar, recursos, icon, dbStatus] = row as [
-      number, string, number, number, string, string, string
-    ];
-    const mqttStatus = getRoomStatus(id as number);
-    const status = mqttStatus !== "livre" ? mqttStatus : dbStatus;
+  const result = salas.map((sala) => {
+    const mqttStatus = getRoomStatus(sala.id);
+    const status = mqttStatus !== "livre" ? mqttStatus : sala.status;
 
     return {
-      id,
-      nome,
-      capacidade,
-      andar,
-      recursos: JSON.parse(recursos as string),
-      icon,
+      id: sala.id,
+      nome: sala.nome,
+      capacidade: sala.capacidade,
+      andar: sala.andar,
+      recursos: JSON.parse(sala.recursos as string),
+      icon: sala.icon,
       status,
     };
-  }) || [];
+  });
 
-  res.json(salas);
+  res.json(result);
 });
 
-router.get("/:id/slots", authMiddleware, (req: AuthRequest, res: Response): void => {
+router.get("/:id/slots", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const salaId = parseInt(req.params.id, 10);
   const { data } = req.query;
 
@@ -58,25 +54,18 @@ router.get("/:id/slots", authMiddleware, (req: AuthRequest, res: Response): void
     return;
   }
 
-  const db = getDb();
-
-  const reservasRows = db.exec(
-    `SELECT hora_inicio, hora_fim FROM reservas
-     WHERE sala_id = ? AND data = ? AND status != 'cancelada'`,
-    [salaId, data as string]
-  );
-
-  const reservas: { hora_inicio: string; hora_fim: string }[] =
-    reservasRows.length > 0
-      ? reservasRows[0].values.map((row: any[]) => ({
-          hora_inicio: row[0] as string,
-          hora_fim: row[1] as string,
-        }))
-      : [];
+  const reservas = await prisma.reserva.findMany({
+    where: {
+      salaId,
+      data: data as string,
+      status: { not: "cancelada" },
+    },
+    select: { horaInicio: true, horaFim: true },
+  });
 
   const slots = ALL_SLOTS.map(({ inicio, fim }) => {
     const conflito = reservas.some(
-      (r) => r.hora_inicio < fim && r.hora_fim > inicio
+      (r) => r.horaInicio < fim && r.horaFim > inicio
     );
     return {
       inicio,

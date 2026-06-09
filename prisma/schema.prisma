@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int       @id @default(autoincrement())
+  email     String    @unique
+  matricula String
+  senhaHash String    @map("senha_hash")
+  createdAt DateTime  @default(now()) @map("created_at")
+  reservas  Reserva[]
+
+  @@map("users")
+}
+
+model Sala {
+  id         Int       @id @default(autoincrement())
+  nome       String
+  capacidade Int
+  andar      Int
+  recursos   String    @default("[]")
+  icon       String    @default("users")
+  status     String    @default("livre")
+  reservas   Reserva[]
+
+  @@map("salas")
+}
+
+model Reserva {
+  id                  Int       @id @default(autoincrement())
+  userId              Int       @map("user_id")
+  salaId              Int       @map("sala_id")
+  data                String
+  horaInicio          String    @map("hora_inicio")
+  horaFim             String    @map("hora_fim")
+  status              String    @default("pendente")
+  mqttInicioEnviado   Int       @default(0) @map("mqtt_inicio_enviado")
+  mqttFimEnviado      Int       @default(0) @map("mqtt_fim_enviado")
+  mqttInicioEnviadoAt DateTime? @map("mqtt_inicio_enviado_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  user User  @relation(fields: [userId], references: [id])
+  sala Sala  @relation(fields: [salaId], references: [id])
+
+  @@map("reservas")
+}

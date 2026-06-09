@@ -1,5 +1,5 @@
 import mqtt, { MqttClient } from "mqtt";
-import { getDb, saveDb } from "../database";
+import prisma from "../lib/prisma";
 
 const BROKER_URL = "mqtt://broker.hivemq.com:1883";
 
@@ -48,7 +48,7 @@ export function connectMQTT(): Promise<void> {
       resolve();
     });
 
-    client.on("message", (topic, message) => {
+    client.on("message", async (topic, message) => {
       const payload = message.toString().trim();
       const match = topic.match(/^senac\/biblioteca\/sala(\d+)\/status$/);
       if (match) {
@@ -57,9 +57,10 @@ export function connectMQTT(): Promise<void> {
         console.log(`[MQTT] Status sala ${salaId}: ${payload}`);
 
         try {
-          const db = getDb();
-          db.run("UPDATE salas SET status = ? WHERE id = ?", [payload, salaId]);
-          saveDb();
+          await prisma.sala.update({
+            where: { id: salaId },
+            data: { status: payload },
+          });
         } catch {}
       }
     });

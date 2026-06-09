@@ -1,12 +1,11 @@
 import { Router, Response } from "express";
-import { getDb, saveDb } from "../database";
+import prisma from "../lib/prisma";
 import { authMiddleware, AuthRequest } from "../middleware/auth";
 import { publishCommand } from "../services/mqtt";
 
 const router = Router();
 
-// POST criar reserva
-router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
+router.post("/", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const { salaId, data, horaInicio, horaFim } = req.body;
 
   if (!salaId || !data || !horaInicio || !horaFim) {
@@ -14,45 +13,50 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
     return;
   }
 
-  const db = getDb();
-
-  const sala = db.exec("SELECT id, nome, status FROM salas WHERE id = ?", [salaId]);
-  if (sala.length === 0 || sala[0].values.length === 0) {
+  const sala = await prisma.sala.findUnique({ where: { id: salaId } });
+  if (!sala) {
     res.status(404).json({ error: "Sala não encontrada" });
     return;
   }
 
-  const [salaIdDb, nome, status] = sala[0].values[0] as [number, string, string];
-  if (status === "ocupada") {
-    res.status(409).json({ error: `Sala ${nome} está ocupada no momento` });
+  if (sala.status === "ocupada") {
+    res.status(409).json({ error: `Sala ${sala.nome} está ocupada no momento` });
     return;
   }
 
-  const conflito = db.exec(
-    `SELECT id FROM reservas
-     WHERE sala_id = ? AND data = ? AND status != 'cancelada'
-       AND NOT (hora_fim <= ? OR hora_inicio >= ?)`,
-    [salaId, data, horaInicio, horaFim]
-  );
-  if (conflito.length > 0 && conflito[0].values.length > 0) {
+  const conflito = await prisma.reserva.findFirst({
+    where: {
+      salaId,
+      data,
+      status: { not: "cancelada" },
+      AND: [
+        { NOT: { horaFim: { lte: horaInicio } } },
+        { NOT: { horaInicio: { gte: horaFim } } },
+      ],
+    },
+  });
+  if (conflito) {
     res.status(409).json({ error: "Já existe uma reserva neste horário para esta sala" });
     return;
   }
 
-  db.run(
-    "INSERT INTO reservas (user_id, sala_id, data, hora_inicio, hora_fim, status, mqtt_inicio_enviado, mqtt_fim_enviado) VALUES (?, ?, ?, ?, ?, 'pendente', 0, 0)",
-    [req.userId, salaId, data, horaInicio, horaFim]
-  );
-
-  saveDb();
-
-  const result = db.exec("SELECT last_insert_rowid() as id");
-  const reservaId = result[0].values[0][0] as number;
+  const reserva = await prisma.reserva.create({
+    data: {
+      userId: req.userId!,
+      salaId,
+      data,
+      horaInicio,
+      horaFim,
+      status: "pendente",
+      mqttInicioEnviado: 0,
+      mqttFimEnviado: 0,
+    },
+  });
 
   res.status(201).json({
-    id: reservaId,
+    id: reserva.id,
     salaId,
-    nome,
+    nome: sala.nome,
     data,
     horaInicio,
     horaFim,
@@ -60,187 +64,165 @@ router.post("/", authMiddleware, (req: AuthRequest, res: Response): void => {
   });
 });
 
-// GET listar reservas do usuário
-router.get("/", authMiddleware, (req: AuthRequest, res: Response): void => {
-  const db = getDb();
-  const rows = db.exec(
-    `SELECT r.id, s.nome, r.data, r.hora_inicio, r.hora_fim, r.status, r.sala_id
-     FROM reservas r
-     JOIN salas s ON r.sala_id = s.id
-     WHERE r.user_id = ?
-     ORDER BY r.data DESC, r.hora_inicio DESC`,
-    [req.userId]
-  );
+router.get("/", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
+  const reservas = await prisma.reserva.findMany({
+    where: { userId: req.userId },
+    include: { sala: { select: { nome: true } } },
+    orderBy: [{ data: "desc" }, { horaInicio: "desc" }],
+  });
 
-  const reservas = rows[0]?.values.map((row: any[]) => {
-    const [id, roomName, date, timeStart, timeEnd, status, salaId] = row as [
-      number, string, string, string, string, string, number
-    ];
-    return {
-      id,
-      salaId,
-      roomName,
-      date,
-      time: `${timeStart} - ${timeEnd}`,
-      status,
-      horaInicio: timeStart,
-      horaFim: timeEnd,
-    };
-  }) || [];
+  const result = reservas.map((r) => ({
+    id: r.id,
+    salaId: r.salaId,
+    roomName: r.sala.nome,
+    date: r.data,
+    time: `${r.horaInicio} - ${r.horaFim}`,
+    status: r.status,
+    horaInicio: r.horaInicio,
+    horaFim: r.horaFim,
+  }));
 
-  res.json(reservas);
+  res.json(result);
 });
 
-// 🆕 LIMPAR TODO O HISTÓRICO (remove todas as reservas finalizadas)
-// ATENÇÃO: Deve vir ANTES de qualquer rota que use :id
-router.delete("/historico/limpar", authMiddleware, (req: AuthRequest, res: Response): void => {
-  console.log("[API] Rota /historico/limpar chamada");
-  const db = getDb();
+router.delete("/historico/limpar", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const userId = req.userId!;
+  const now = new Date();
 
-  const agora = new Date();
-  const agoraStr = agora.toISOString().slice(0, 19).replace("T", " ");
+  const todasReservas = await prisma.reserva.findMany({ where: { userId } });
 
-  const deleteStmt = db.prepare(`
-    DELETE FROM reservas
-    WHERE user_id = ?
-      AND ( status = 'cancelada'
-            OR (data || ' ' || hora_fim) <= ? )
-  `);
-  deleteStmt.run([userId, agoraStr]);
-  deleteStmt.free();
+  const idsParaDeletar = todasReservas
+    .filter((r) => {
+      if (r.status === "cancelada") return true;
+      const [h, m] = r.horaFim.split(":").map(Number);
+      const fimReserva = new Date(`${r.data}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`);
+      return fimReserva <= now;
+    })
+    .map((r) => r.id);
 
-  saveDb();
+  if (idsParaDeletar.length > 0) {
+    await prisma.reserva.deleteMany({ where: { id: { in: idsParaDeletar } } });
+  }
+
   res.json({ message: "Histórico limpo com sucesso" });
 });
 
-// 🆕 EXCLUIR UMA RESERVA PERMANENTEMENTE (do histórico)
-router.delete("/:id/permanent", authMiddleware, (req: AuthRequest, res: Response): void => {
+router.delete("/:id/permanent", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
     res.status(400).json({ error: "ID inválido" });
     return;
   }
 
-  const db = getDb();
+  const reserva = await prisma.reserva.findFirst({
+    where: { id: reservaId, userId: req.userId },
+  });
 
-  const row = db.exec(
-    "SELECT id, status, data, hora_fim FROM reservas WHERE id = ? AND user_id = ?",
-    [reservaId, req.userId]
-  );
-
-  if (row.length === 0 || row[0].values.length === 0) {
+  if (!reserva) {
     res.status(404).json({ error: "Reserva não encontrada" });
     return;
   }
 
-  const [id, status, data, horaFim] = row[0].values[0] as [number, string, string, string];
-
   const agora = new Date();
-  const fim = new Date(`${data}T${horaFim}:00`);
-  if (status !== "cancelada" && fim > agora) {
+  const [h, m] = reserva.horaFim.split(":").map(Number);
+  const fim = new Date(`${reserva.data}T${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`);
+
+  if (reserva.status !== "cancelada" && fim > agora) {
     res.status(400).json({ error: "Não é possível excluir uma reserva ativa. Use 'Liberar' primeiro." });
     return;
   }
 
-  db.run("DELETE FROM reservas WHERE id = ?", [reservaId]);
-  saveDb();
+  await prisma.reserva.delete({ where: { id: reservaId } });
 
   res.json({ message: "Reserva removida permanentemente do histórico." });
 });
 
-// DELETE cancelar reserva (apenas muda status para 'cancelada')
-router.delete("/:id", authMiddleware, (req: AuthRequest, res: Response): void => {
+router.delete("/:id", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
     res.status(400).json({ error: "ID inválido" });
     return;
   }
 
-  const db = getDb();
-  const rows = db.exec(
-    "SELECT r.id, r.sala_id, r.status, r.mqtt_inicio_enviado, s.nome FROM reservas r JOIN salas s ON r.sala_id = s.id WHERE r.id = ? AND r.user_id = ?",
-    [reservaId, req.userId]
-  );
+  const reserva = await prisma.reserva.findFirst({
+    where: { id: reservaId, userId: req.userId },
+    include: { sala: { select: { nome: true } } },
+  });
 
-  if (rows.length === 0 || rows[0].values.length === 0) {
+  if (!reserva) {
     res.status(404).json({ error: "Reserva não encontrada" });
     return;
   }
 
-  const [id, salaId, status, mqttInicioEnviado, nome] = rows[0].values[0] as [number, number, string, number, string];
-
-  if (status === "cancelada") {
+  if (reserva.status === "cancelada") {
     res.status(400).json({ error: "Reserva já está cancelada" });
     return;
   }
 
-  db.run("UPDATE reservas SET status = 'cancelada', mqtt_fim_enviado = 1 WHERE id = ?", [reservaId]);
+  await prisma.reserva.update({
+    where: { id: reservaId },
+    data: { status: "cancelada", mqttFimEnviado: 1 },
+  });
 
-  const outrasAtivas = db.exec(
-    "SELECT COUNT(*) as c FROM reservas WHERE sala_id = ? AND status != 'cancelada' AND id != ?",
-    [salaId, reservaId]
-  );
-  const count = outrasAtivas[0].values[0][0] as number;
-  if (count === 0) {
-    db.run("UPDATE salas SET status = 'livre' WHERE id = ?", [salaId]);
+  const outrasAtivas = await prisma.reserva.count({
+    where: { salaId: reserva.salaId, status: { not: "cancelada" }, id: { not: reservaId } },
+  });
+  if (outrasAtivas === 0) {
+    await prisma.sala.update({ where: { id: reserva.salaId }, data: { status: "livre" } });
   }
 
-  saveDb();
-
-  if (mqttInicioEnviado === 1) {
-    publishCommand(salaId, "liberar");
+  if (reserva.mqttInicioEnviado === 1) {
+    publishCommand(reserva.salaId, "liberar");
   }
 
-  res.json({ message: `Reserva da ${nome} cancelada com sucesso` });
+  res.json({ message: `Reserva da ${reserva.sala.nome} cancelada com sucesso` });
 });
 
-// POST confirmar reserva (ocupar)
-router.post("/:id/ocupar", authMiddleware, (req: AuthRequest, res: Response): void => {
+router.post("/:id/ocupar", authMiddleware, async (req: AuthRequest, res: Response): Promise<void> => {
   const reservaId = parseInt(req.params.id, 10);
   if (isNaN(reservaId)) {
     res.status(400).json({ error: "ID inválido" });
     return;
   }
 
-  const db = getDb();
-  const rows = db.exec(
-    "SELECT r.id, r.sala_id, r.status, r.data, r.hora_inicio, r.hora_fim FROM reservas r WHERE r.id = ? AND r.user_id = ?",
-    [reservaId, req.userId]
-  );
+  const reserva = await prisma.reserva.findFirst({
+    where: { id: reservaId, userId: req.userId },
+  });
 
-  if (rows.length === 0 || rows[0].values.length === 0) {
+  if (!reserva) {
     res.status(404).json({ error: "Reserva não encontrada" });
     return;
   }
 
-  const [id, salaId, status, data, horaInicio, horaFim] = rows[0].values[0] as [number, number, string, string, string, string];
-
-  if (status === "cancelada") {
+  if (reserva.status === "cancelada") {
     res.status(400).json({ error: "Reserva já foi cancelada" });
     return;
   }
 
-  if (status === "confirmada") {
+  if (reserva.status === "confirmada") {
     res.status(400).json({ error: "Reserva já foi confirmada" });
     return;
   }
 
-  const nowLocal = db.exec("SELECT datetime('now', 'localtime') as now")[0].values[0][0] as string;
-  const inicio = `${data} ${horaInicio}`;
-  const fim = `${data} ${horaFim}`;
+  const now = new Date();
+  const [hiH, hiM] = reserva.horaInicio.split(":").map(Number);
+  const [hfH, hfM] = reserva.horaFim.split(":").map(Number);
+  const inicio = new Date(`${reserva.data}T${String(hiH).padStart(2, "0")}:${String(hiM).padStart(2, "0")}:00`);
+  const fim = new Date(`${reserva.data}T${String(hfH).padStart(2, "0")}:${String(hfM).padStart(2, "0")}:00`);
 
-  if (nowLocal < inicio || nowLocal > fim) {
+  if (now < inicio || now > fim) {
     res.status(400).json({ error: "Só é possível confirmar a reserva durante o horário reservado" });
     return;
   }
 
-  const now = new Date().toISOString().replace("T", " ").replace("Z", "");
-  db.run("UPDATE reservas SET status = 'confirmada', mqtt_inicio_enviado = 1, mqtt_inicio_enviado_at = ? WHERE id = ?", [now, reservaId]);
-  db.run("UPDATE salas SET status = 'ocupada' WHERE id = ?", [salaId]);
-  saveDb();
+  await prisma.reserva.update({
+    where: { id: reservaId },
+    data: { status: "confirmada", mqttInicioEnviado: 1, mqttInicioEnviadoAt: now },
+  });
 
-  publishCommand(salaId, "ocupar");
+  await prisma.sala.update({ where: { id: reserva.salaId }, data: { status: "ocupada" } });
+
+  publishCommand(reserva.salaId, "ocupar");
 
   res.json({ message: "Sala ocupada com sucesso" });
 });
