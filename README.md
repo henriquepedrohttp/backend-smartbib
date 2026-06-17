@@ -2,16 +2,43 @@
 
 API REST + bridge MQTT para o sistema de reservas de salas da biblioteca SENAC. Gerencia autenticacao, salas, reservas e sincroniza o estado com dispositivos ESP32 via MQTT.
 
+## Arquitetura
+
+- **Linguagem:** TypeScript
+- **Runtime:** Node.js 20
+- **Framework:** Express.js
+- **ORM:** Prisma
+- **Banco de Dados:** PostgreSQL 16.4 (AWS RDS)
+- **Infraestrutura:** AWS (EC2 + RDS + VPC) provisionada via Terraform
+- **Comunicacao IoT:** MQTT (HiveMQ publico broker.hivemq.com:1883)
+
+## Funcionalidades
+
+- Cadastro e login de usuarios (JWT)
+- Listagem de salas com status em tempo real (via MQTT)
+- Consulta de horarios disponiveis por sala/data
+- Criacao e cancelamento de reservas
+- Confirmacao de ocupacao da sala (comando MQTT)
+- Agendador automatico (60s) para:
+  - Enviar comando "reservar" no horario de inicio
+  - Auto-cancelar reservas nao confirmadas em 5 minutos
+  - Enviar comando "liberar" ao fim do horario
+
 ## Pre-requisitos
 
-- **Node.js** 18+
-- **npm** 9+
+- Node.js 18+
+- npm 9+
+- PostgreSQL 16 (local via Docker Compose ou nativo)
+- Terraform 1.0+ (para deploy AWS)
 
-## Instalacao
+## Setup Local
 
 ```bash
-cd backend-smartbib
+cp .env.example .env
 npm install
+docker-compose up -d           # Sobe PostgreSQL local
+npx prisma migrate deploy      # Aplica migrations
+npm run dev                    # Inicia em http://localhost:3000
 ```
 
 ## Configuracao
@@ -28,6 +55,7 @@ Variaveis disponiveis:
 |---|---|---|
 | `PORT` | Porta do servidor Express | `3000` |
 | `JWT_SECRET` | Chave secreta para tokens JWT | `smartbib-secret-key-2025` |
+| `DATABASE_URL` | URL de conexao PostgreSQL | `postgresql://smartbib:smartbib123@localhost:5432/smartbib` |
 
 ## Rodando
 
@@ -84,21 +112,24 @@ Os slots sao fixos de 08:00 as 22:00 com intervalo de almoco (12:00-13:00). Um s
 ## Arquitetura
 
 ```
-Mobile App (Expo) ──► Express :3000
-                           │
-                           ├── sql.js (SQLite, WAL mode) ── smartbib.db
-                           │
-                           ├── MQTT Client (mqtt.js)
-                           │     Pub:  senac/biblioteca/sala{id}/comando
-                           │     Sub:  senac/biblioteca/+/status
-                           │
-                           └── Scheduler (setInterval 60s)
-                                 processOcupar → processAutoCancel → processLiberar
+Mobile App (Expo) ──► nginx :80 ─► Express :3000
+                         (EC2)
+                            │
+                            ├── Prisma ORM ──► RDS PostgreSQL :5432
+                            │
+                            ├── MQTT Client (mqtt.js)
+                            │     Pub:  senac/biblioteca/sala{id}/comando
+                            │     Sub:  senac/biblioteca/+/status
+                            │        ↕ broker.hivemq.com:1883 ↕
+                            │              ESP32
+                            │
+                            └── Scheduler (setInterval 60s)
+                                  processOcupar → processAutoCancel → processLiberar
 ```
 
-### Banco de Dados (SQLite)
+### Banco de Dados (PostgreSQL + Prisma)
 
-- **sql.js** -- SQLite compilado para JavaScript, persistido em disco com WAL mode
+- **Prisma ORM** com migrations versionadas
 - **users** -- `id`, `email` (UNIQUE), `matricula`, `senha_hash` (bcrypt), `created_at`
 - **salas** -- `id`, `nome`, `capacidade`, `andar`, `recursos` (JSON), `icon`, `status` (livre/reservada/ocupada)
 - **reservas** -- `id`, `user_id` (FK), `sala_id` (FK), `data`, `hora_inicio`, `hora_fim`, `status` (pendente/confirmada/cancelada), `mqtt_inicio_enviado`, `mqtt_fim_enviado`, `mqtt_inicio_enviado_at`, `created_at`
@@ -136,12 +167,60 @@ O scheduler executa 3 etapas em ordem a cada 60 segundos:
 
 O diretorio `infra/` contem a definicao completa de infraestrutura como codigo:
 
+- **VPC** 10.0.0.0/16 com 2 subnets publicas em AZs diferentes e Internet Gateway
 - **EC2 t3.micro** com Ubuntu 22.04
+- **RDS PostgreSQL 16.4** db.t4g.micro, 20GB, single-AZ, acesso restrito ao EC2
 - **nginx** como reverse proxy (porta 80 -> localhost:3000)
-- **VPC** com subnet publica e security group (SSH + HTTP)
+- **Elastic IP** para endereco publico fixo
+- **Security Groups** com principio de menor privilegio
 - Bootstrap automatico via `user_data.sh` (Node 20, clone do repo, build, systemd)
 
 ```bash
 cd infra
-terraform apply
+cp terraform.tfvars.example terraform.tfvars
+# Edite terraform.tfvars com suas variaveis
+terraform init
+terraform apply                # ~7 minutos
+```
+
+## Deploy AWS
+
+Guia completo em [`DEPLOY.md`](DEPLOY.md).
+
+## Documentacao
+
+Documento tecnico completo em [`docs/documento-tecnico.md`](docs/documento-tecnico.md).
+
+## Estrutura do Projeto
+
+```
+.
+├── src/
+│   ├── index.ts              # Entry point
+│   ├── lib/prisma.ts          # Prisma client singleton
+│   ├── middleware/auth.ts     # JWT middleware
+│   ├── routes/
+│   │   ├── auth.ts            # Auth endpoints
+│   │   ├── salas.ts           # Room endpoints
+│   │   └── reservas.ts        # Reservation endpoints
+│   └── services/
+│       ├── mqtt.ts            # MQTT client
+│       └── mqttScheduler.ts   # 60s polling scheduler
+├── prisma/
+│   ├── schema.prisma          # Data model
+│   ├── seed.ts                # Seed data
+│   └── migrations/            # Versioned migrations
+├── infra/                     # Terraform (AWS)
+│   ├── main.tf
+│   ├── vpc.tf
+│   ├── ec2.tf
+│   ├── rds.tf
+│   ├── security.tf
+│   ├── eip.tf
+│   ├── user_data.sh
+│   └── nginx.conf
+├── docs/
+│   └── documento-tecnico.md   # Documento tecnico do projeto
+├── docker-compose.yml         # PostgreSQL local
+└── package.json
 ```
